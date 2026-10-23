@@ -24,7 +24,7 @@ spec:
         kubernetes.io/hostname: ubuntu04
       containers:
         - name: app
-          image: localhost:5000/thermal-monitor:20261023.3
+          image: localhost:5000/thermal-monitor:20261023.5
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -32,8 +32,6 @@ spec:
           env:
             - name: BIND
               value: "0.0.0.0:8080"
-            - name: HOST_LABEL
-              value: ubuntu04
             - name: THERMAL_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -55,6 +53,77 @@ spec:
               memory: 24Mi
             limits:
               memory: 128Mi
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: thermal-agent
+  namespace: thermal-monitor
+  labels:
+    app: thermal-agent
+spec:
+  selector:
+    matchLabels:
+      app: thermal-agent
+  template:
+    metadata:
+      labels:
+        app: thermal-agent
+    spec:
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: fetch
+          image: alpine:3.20
+          command:
+            - /bin/sh
+            - -c
+            - wget -qO /shared/thermal http://thermal-monitor.thermal-monitor.svc.cluster.local/agent/binary && chmod +x /shared/thermal
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      containers:
+        - name: agent
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command:
+            - /shared/thermal
+            - push
+            - --url
+            - http://thermal-monitor.thermal-monitor.svc.cluster.local/api/report
+            - --token-file
+            - /etc/thermal/token
+            - --interval
+            - "15"
+          env:
+            - name: HOST_LABEL
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: token
+              mountPath: /etc/thermal
+              readOnly: true
+            - name: hostroot
+              mountPath: /host
+              readOnly: true
+          resources:
+            requests:
+              cpu: 5m
+              memory: 12Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: shared
+          emptyDir: {}
+        - name: token
+          secret:
+            secretName: thermal-token
+        - name: hostroot
+          hostPath:
+            path: /
 ---
 apiVersion: v1
 kind: Service

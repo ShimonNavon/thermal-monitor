@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -6,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -29,32 +31,32 @@ struct Zone {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 struct Reading {
     host: String,
     source: String,
     ts_ms: u64,
     cpu_c: Option<f64>,
     gpu_c: Option<f64>,
+    cpu_used_pct: Option<f64>,
+    load1: Option<f64>,
+    load5: Option<f64>,
+    load15: Option<f64>,
+    mem_used_pct: Option<f64>,
+    mem_total_gb: Option<f64>,
+    disk_used_pct: Option<f64>,
+    disk_total_gb: Option<f64>,
+    uptime_s: Option<u64>,
+    cores: Option<u32>,
+    freq_mhz: Option<u64>,
     fans: Vec<Fan>,
     zones: Vec<Zone>,
 }
 
-#[derive(Deserialize)]
-struct Report {
-    host: Option<String>,
-    source: Option<String>,
-    cpu_c: Option<f64>,
-    gpu_c: Option<f64>,
-    #[serde(default)]
-    fans: Vec<Fan>,
-}
-
 #[derive(Serialize)]
 struct Snapshot {
-    mac: Option<Reading>,
-    server: Reading,
-    mac_history: Vec<Reading>,
-    server_history: Vec<Reading>,
+    nodes: Vec<Reading>,
+    history: HashMap<String, Vec<Reading>>,
     token_required: bool,
 }
 
@@ -62,14 +64,12 @@ struct Snapshot {
 struct AppState {
     inner: Arc<Mutex<Inner>>,
     token: Option<String>,
-    host_label: String,
 }
 
 #[derive(Default)]
 struct Inner {
-    mac: Option<Reading>,
-    mac_history: VecDeque<Reading>,
-    server_history: VecDeque<Reading>,
+    nodes: HashMap<String, Reading>,
+    history: HashMap<String, VecDeque<Reading>>,
 }
 
 fn now_ms() -> u64 {
@@ -79,24 +79,170 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn read_trim(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn cmd_out(program: &str, args: &[&str]) -> Option<String> {
+    Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
 fn hostname() -> String {
+    if let Ok(label) = std::env::var("HOST_LABEL") {
+        if !label.trim().is_empty() {
+            return label.trim().to_string();
+        }
+    }
     if cfg!(target_os = "macos") {
-        if let Ok(out) = Command::new("scutil").args(["--get", "ComputerName"]).output() {
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Some(name) = cmd_out("scutil", &["--get", "ComputerName"]) {
+            let name = name.trim().to_string();
             if !name.is_empty() {
                 return name;
             }
         }
     }
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOST_LABEL").ok())
-        .unwrap_or_else(|| "server".to_string())
+    read_trim("/etc/hostname").unwrap_or_else(|| "server".to_string())
 }
 
-fn sample_macmon() -> Result<Reading> {
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+#[cfg(target_os = "linux")]
+fn disk_usage(path: &str) -> Option<(f64, f64)> {
+    let c = CString::new(path).ok()?;
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) == 0 && st.f_blocks > 0 {
+            let total = st.f_blocks as f64 * st.f_frsize as f64;
+            let avail = st.f_bavail as f64 * st.f_frsize as f64;
+            return Some(((total - avail) / total * 100.0, total / 1_073_741_824.0));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn disk_usage(path: &str) -> Option<(f64, f64)> {
+    let c = CString::new(path).ok()?;
+    unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_blocks > 0 {
+            let total = st.f_blocks as f64 * st.f_bsize as f64;
+            let avail = st.f_bavail as f64 * st.f_bsize as f64;
+            return Some(((total - avail) / total * 100.0, total / 1_073_741_824.0));
+        }
+    }
+    None
+}
+
+fn linux_stats(r: &mut Reading) {
+    if let Some(load) = read_trim("/proc/loadavg") {
+        let nums: Vec<f64> = load
+            .split_whitespace()
+            .take(3)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if nums.len() == 3 {
+            r.load1 = Some(round1(nums[0]));
+            r.load5 = Some(round1(nums[1]));
+            r.load15 = Some(round1(nums[2]));
+        }
+    }
+
+    if let Some(mem) = read_trim("/proc/meminfo") {
+        let field = |name: &str| -> Option<f64> {
+            mem.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<f64>().ok())
+        };
+        if let (Some(total_kb), Some(avail_kb)) = (field("MemTotal:"), field("MemAvailable:")) {
+            if total_kb > 0.0 {
+                r.mem_used_pct = Some(round1((total_kb - avail_kb) / total_kb * 100.0));
+                r.mem_total_gb = Some(round1(total_kb / 1_048_576.0));
+            }
+        }
+    }
+
+    if let Some(up) = read_trim("/proc/uptime") {
+        r.uptime_s = up
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v as u64);
+    }
+
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        r.cores = Some(cpuinfo.lines().filter(|l| l.starts_with("processor")).count() as u32);
+        r.freq_mhz = r.freq_mhz.or_else(|| {
+            cpuinfo
+                .lines()
+                .find(|l| l.starts_with("cpu MHz"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|v| v as u64)
+        });
+    }
+    if r.freq_mhz.is_none() {
+        if let Some(khz) = read_trim("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            r.freq_mhz = Some(khz / 1000);
+        }
+    }
+
+    let disk_path = if Path::new("/host").exists() { "/host" } else { "/" };
+    if let Some((pct, total_gb)) = disk_usage(disk_path) {
+        r.disk_used_pct = Some(round1(pct));
+        r.disk_total_gb = Some(round1(total_gb));
+    }
+
+    r.fans = linux_fans();
+}
+
+fn linux_fans() -> Vec<Fan> {
+    let mut fans = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") else {
+        return fans;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let chip = read_trim(dir.join("name").to_str().unwrap_or("")).unwrap_or_default();
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        for f in files.flatten() {
+            let name = f.file_name().to_string_lossy().to_string();
+            if !name.starts_with("fan") || !name.ends_with("_input") {
+                continue;
+            }
+            let Some(rpm) = read_trim(f.path().to_str().unwrap_or(""))
+                .and_then(|v| v.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let label_file = dir.join(name.replace("_input", "_label"));
+            let label = read_trim(label_file.to_str().unwrap_or(""))
+                .unwrap_or_else(|| format!("{chip} {}", name.trim_end_matches("_input")));
+            let max_file = dir.join(name.replace("_input", "_max"));
+            let max_rpm = read_trim(max_file.to_str().unwrap_or(""))
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            fans.push(Fan { name: label, rpm, max_rpm });
+        }
+    }
+    fans.truncate(4);
+    fans
+}
+
+fn macmon_reading(host: &str) -> Result<Reading> {
     let mut child = Command::new("macmon")
         .arg("pipe")
         .arg("-i")
@@ -114,8 +260,6 @@ fn sample_macmon() -> Result<Reading> {
     read.context("reading macmon output")?;
 
     let v: serde_json::Value = serde_json::from_str(line.trim()).context("parsing macmon JSON")?;
-    let cpu = v["temp"]["cpu_temp_avg"].as_f64();
-    let gpu = v["temp"]["gpu_temp_avg"].as_f64();
     let fans = v["fans"]
         .as_array()
         .map(|arr| {
@@ -129,81 +273,142 @@ fn sample_macmon() -> Result<Reading> {
         })
         .unwrap_or_default();
 
-    Ok(Reading {
-        host: hostname(),
+    let mut r = Reading {
+        host: host.to_string(),
         source: "macmon".into(),
         ts_ms: now_ms(),
-        cpu_c: cpu,
-        gpu_c: gpu,
+        cpu_c: v["temp"]["cpu_temp_avg"].as_f64(),
+        gpu_c: v["temp"]["gpu_temp_avg"].as_f64(),
+        cpu_used_pct: v["cpu_usage_pct"].as_f64().map(|x| round1(x * 100.0)),
+        freq_mhz: v["pcpu_freq_mhz"].as_u64(),
         fans,
-        zones: Vec::new(),
-    })
-}
+        ..Default::default()
+    };
 
-fn sample_sysfs(host: &str) -> Reading {
-    let mut zones = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/thermal") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("thermal_zone") {
-                continue;
-            }
-            let base = entry.path();
-            let label = std::fs::read_to_string(base.join("type"))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| name.clone());
-            if let Ok(raw) = std::fs::read_to_string(base.join("temp")) {
-                if let Ok(milli) = raw.trim().parse::<f64>() {
-                    let c = milli / 1000.0;
-                    if (1.0..=150.0).contains(&c) {
-                        zones.push(Zone {
-                            name: label,
-                            temp_c: (c * 10.0).round() / 10.0,
-                        });
-                    }
-                }
-            }
+    if let Some(load) = cmd_out("sysctl", &["-n", "vm.loadavg"]) {
+        let nums: Vec<f64> = load
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|s| !s.is_empty())
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if nums.len() >= 3 {
+            r.load1 = Some(round1(nums[0]));
+            r.load5 = Some(round1(nums[1]));
+            r.load15 = Some(round1(nums[2]));
         }
     }
 
+    let total_bytes = cmd_out("sysctl", &["-n", "hw.memsize"])
+        .and_then(|s| s.trim().parse::<f64>().ok());
+    if let Some(total) = total_bytes {
+        if let Some(vm) = cmd_out("vm_stat", &[]) {
+            let page_size = vm
+                .lines()
+                .next()
+                .and_then(|l| l.split("page size of ").nth(1))
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|n| n.parse::<f64>().ok())
+                .unwrap_or(4096.0);
+            let pages = |key: &str| -> f64 {
+                vm.lines()
+                    .find(|l| l.starts_with(key))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().replace('.', "").parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            };
+            let used = (pages("Pages active") + pages("Pages wired down") + pages("Pages occupied by compressor"))
+                * page_size;
+            r.mem_used_pct = Some(round1(used / total * 100.0));
+            r.mem_total_gb = Some(round1(total / 1_073_741_824.0));
+        }
+    }
+
+    if let Some(boot) = cmd_out("sysctl", &["-n", "kern.boottime"]) {
+        let secs = boot
+            .split("sec = ")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse::<u64>().ok());
+        if let Some(secs) = secs {
+            let now = now_ms() / 1000;
+            r.uptime_s = Some(now.saturating_sub(secs));
+        }
+    }
+
+    r.cores = cmd_out("sysctl", &["-n", "hw.ncpu"])
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    if let Some((pct, total_gb)) = disk_usage("/") {
+        r.disk_used_pct = Some(round1(pct));
+        r.disk_total_gb = Some(round1(total_gb));
+    }
+
+    Ok(r)
+}
+
+fn sample_local(host: &str) -> Reading {
+    if cfg!(target_os = "macos") {
+        macmon_reading(host).unwrap_or_else(|e| Reading {
+            host: host.to_string(),
+            source: format!("macmon error: {e}"),
+            ts_ms: now_ms(),
+            ..Default::default()
+        })
+    } else {
+        let mut r = Reading {
+            host: host.to_string(),
+            source: "sysfs".into(),
+            ts_ms: now_ms(),
+            ..Default::default()
+        };
+        r.zones = linux_zones();
+        r.cpu_c = estimate_cpu(&r.zones);
+        linux_stats(&mut r);
+        r
+    }
+}
+
+fn linux_zones() -> Vec<Zone> {
+    let mut zones = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/thermal") else {
+        return zones;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("thermal_zone") {
+            continue;
+        }
+        let base = entry.path();
+        let label = read_trim(base.join("type").to_str().unwrap_or(""))
+            .unwrap_or_else(|| name.clone());
+        if let Some(milli) = read_trim(base.join("temp").to_str().unwrap_or(""))
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            let c = milli / 1000.0;
+            if (1.0..=150.0).contains(&c) {
+                zones.push(Zone {
+                    name: label,
+                    temp_c: round1(c),
+                });
+            }
+        }
+    }
+    zones
+}
+
+fn estimate_cpu(zones: &[Zone]) -> Option<f64> {
     let cpu_like = |z: &Zone| {
         let n = z.name.to_lowercase();
         ["pkg", "core", "cpu", "tdie", "tctl", "soc"]
             .iter()
             .any(|k| n.contains(k))
     };
-    let cpu_c = zones
+    zones
         .iter()
         .filter(|z| cpu_like(z))
         .map(|z| z.temp_c)
         .reduce(f64::max)
-        .or_else(|| zones.iter().map(|z| z.temp_c).reduce(f64::max));
-
-    Reading {
-        host: host.to_string(),
-        source: "sysfs".into(),
-        ts_ms: now_ms(),
-        cpu_c,
-        gpu_c: None,
-        fans: Vec::new(),
-        zones,
-    }
-}
-
-fn sample_local(host: &str) -> Reading {
-    if cfg!(target_os = "macos") {
-        match sample_macmon() {
-            Ok(r) => r,
-            Err(e) => Reading {
-                host: host.to_string(),
-                source: format!("macmon error: {e}"),
-                ts_ms: now_ms(),
-                ..Default::default()
-            },
-        }
-    } else {
-        sample_sysfs(host)
-    }
+        .or_else(|| zones.iter().map(|z| z.temp_c).reduce(f64::max))
 }
 
 fn token_from_file(path: &str) -> Result<String> {
@@ -220,13 +425,7 @@ fn push_loop(url: &str, token: Option<String>, interval: Duration, host: &str, o
     let mut failures = 0u32;
     loop {
         let reading = sample_local(host);
-        let payload = serde_json::json!({
-            "host": reading.host,
-            "source": reading.source,
-            "cpu_c": reading.cpu_c,
-            "gpu_c": reading.gpu_c,
-            "fans": reading.fans,
-        });
+        let payload = serde_json::to_value(&reading)?;
         let mut req = client.post(url).json(&payload);
         if let Some(t) = &token {
             req = req.header("x-thermal-token", t);
@@ -235,8 +434,8 @@ fn push_loop(url: &str, token: Option<String>, interval: Duration, host: &str, o
             Ok(resp) if resp.status().is_success() => {
                 failures = 0;
                 eprintln!(
-                    "{} pushed cpu={:?} gpu={:?}",
-                    reading.host, reading.cpu_c, reading.gpu_c
+                    "{} pushed cpu={:?} load={:?} mem={:?}",
+                    reading.host, reading.cpu_c, reading.load1, reading.mem_used_pct
                 );
             }
             Ok(resp) => eprintln!("push failed: HTTP {}", resp.status()),
@@ -255,35 +454,22 @@ fn push_loop(url: &str, token: Option<String>, interval: Duration, host: &str, o
 }
 
 async fn api_temps(State(state): State<AppState>) -> Json<Snapshot> {
-    let server = sample_sysfs(&state.host_label);
-    let (mac, mac_history, server_history) = {
-        let mut inner = state.inner.lock().unwrap();
-        let changed = match (inner.server_history.back(), server.cpu_c) {
-            (Some(last), Some(now)) => last.cpu_c.map_or(true, |prev| (prev - now).abs() >= 0.5),
-            (None, _) => true,
-            _ => false,
-        };
-        let stale = inner
-            .server_history
-            .back()
-            .map_or(true, |last| server.ts_ms.saturating_sub(last.ts_ms) >= 55_000);
-        if changed || stale {
-            inner.server_history.push_back(server.clone());
-            while inner.server_history.len() > HISTORY {
-                inner.server_history.pop_front();
-            }
-        }
-        (
-            inner.mac.clone(),
-            inner.mac_history.iter().cloned().collect::<Vec<_>>(),
-            inner.server_history.iter().cloned().collect::<Vec<_>>(),
-        )
-    };
+    let inner = state.inner.lock().unwrap();
+    let mut nodes: Vec<Reading> = inner.nodes.values().cloned().collect();
+    nodes.sort_by(|a, b| {
+        let mac = |r: &Reading| (r.source != "macmon") as u8;
+        mac(a)
+            .cmp(&mac(b))
+            .then_with(|| a.host.to_lowercase().cmp(&b.host.to_lowercase()))
+    });
+    let history = inner
+        .history
+        .iter()
+        .map(|(k, v)| (k.clone(), v.iter().cloned().collect::<Vec<_>>()))
+        .collect();
     Json(Snapshot {
-        mac,
-        server,
-        mac_history,
-        server_history,
+        nodes,
+        history,
         token_required: state.token.is_some(),
     })
 }
@@ -291,7 +477,7 @@ async fn api_temps(State(state): State<AppState>) -> Json<Snapshot> {
 async fn api_report(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(report): Json<Report>,
+    Json(mut reading): Json<Reading>,
 ) -> StatusCode {
     if let Some(expected) = &state.token {
         let got = headers
@@ -302,25 +488,34 @@ async fn api_report(
             return StatusCode::UNAUTHORIZED;
         }
     }
-    let Some(cpu_c) = report.cpu_c else {
+    if reading.host.trim().is_empty() {
         return StatusCode::BAD_REQUEST;
-    };
-    let reading = Reading {
-        host: report.host.unwrap_or_else(|| "mac".into()),
-        source: report.source.unwrap_or_else(|| "push".into()),
-        ts_ms: now_ms(),
-        cpu_c: Some(cpu_c),
-        gpu_c: report.gpu_c,
-        fans: report.fans,
-        zones: Vec::new(),
-    };
+    }
+    reading.ts_ms = now_ms();
+    let host = reading.host.clone();
     let mut inner = state.inner.lock().unwrap();
-    inner.mac = Some(reading.clone());
-    inner.mac_history.push_back(reading);
-    while inner.mac_history.len() > HISTORY {
-        inner.mac_history.pop_front();
+    inner.nodes.insert(host.clone(), reading.clone());
+    let h = inner.history.entry(host).or_default();
+    h.push_back(reading);
+    while h.len() > HISTORY {
+        h.pop_front();
     }
     StatusCode::NO_CONTENT
+}
+
+async fn agent_binary() -> Response {
+    let bytes = match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
+        Some(b) => b,
+        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response()
 }
 
 async fn health() -> &'static str {
@@ -366,15 +561,12 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&reading)?);
             Ok(())
         }
-        "serve" | _ => {
+        _ => {
             let token = std::env::var("THERMAL_TOKEN").ok().filter(|t| !t.is_empty());
-            let host_label =
-                std::env::var("HOST_LABEL").unwrap_or_else(|_| hostname());
             let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
             let state = AppState {
                 inner: Arc::new(Mutex::new(Inner::default())),
                 token,
-                host_label,
             };
 
             let addr: std::net::SocketAddr = bind.parse().context("BIND address")?;
@@ -386,6 +578,7 @@ fn main() -> Result<()> {
                         .route("/", get(index))
                         .route("/api/temps", get(api_temps))
                         .route("/api/report", post(api_report))
+                        .route("/agent/binary", get(agent_binary))
                         .route("/healthz", get(health))
                         .with_state(state);
                     let listener = tokio::net::TcpListener::bind(addr).await?;
