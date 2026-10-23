@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermal — Mac &amp; server</title>
+<style>
+  :root {
+    --bg: #f6f6f4;
+    --surface: #ffffff;
+    --surface-2: #f0f0ed;
+    --border: #e3e3de;
+    --text: #17181a;
+    --muted: #6b7078;
+    --accent: #e8590c;
+    --ok: #2f9e44;
+    --warn: #f08c00;
+    --danger: #e03131;
+    --shadow: 0 1px 2px rgba(16, 18, 22, 0.04), 0 8px 24px rgba(16, 18, 22, 0.05);
+    --radius: 14px;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d0e10;
+      --surface: #16181b;
+      --surface-2: #1d2024;
+      --border: #26292e;
+      --text: #f1f2f4;
+      --muted: #9aa0a8;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.35);
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 20% -10%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 22px 64px; }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 26px; }
+  .eyebrow {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 6px;
+  }
+  h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+  .sub { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
+    font-size: 12px; color: var(--muted); white-space: nowrap;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .pill.live .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+  .pill.stale .dot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 18%, transparent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 20px 20px 16px;
+  }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .card-title { font-size: 13px; font-weight: 600; letter-spacing: 0.01em; }
+  .card-tag {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+    padding: 2px 7px; border-radius: 999px; font-variant-numeric: tabular-nums;
+  }
+  .temp { display: flex; align-items: flex-start; gap: 4px; margin: 14px 0 2px; }
+  .value { font-size: 54px; font-weight: 650; letter-spacing: -0.045em; line-height: 1; font-variant-numeric: tabular-nums; }
+  .unit { font-size: 18px; font-weight: 500; color: var(--muted); margin-top: 7px; }
+  .value.hot { color: var(--warn); }
+  .value.critical { color: var(--danger); }
+  .meta { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+  .meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .spark { width: 100%; height: 46px; margin-top: 14px; display: block; overflow: visible; }
+  .zones { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; display: grid; gap: 5px; }
+  .zone { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); gap: 12px; }
+  .zone span:last-child { color: var(--text); font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+  section.table-card {
+    margin-top: 16px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+  }
+  .table-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .table-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
+  .table-head .count { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .scroll { max-height: 380px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    position: sticky; top: 0; z-index: 1; background: var(--surface);
+    text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--muted); padding: 9px 18px; border-bottom: 1px solid var(--border);
+  }
+  tbody td { padding: 10px 18px; border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent); font-size: 13px; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; }
+  td.time { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.node { font-weight: 550; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; cursor: copy;
+    font: inherit; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+    font-size: 12px; font-variant-numeric: tabular-nums;
+    transition: border-color 140ms ease, background 140ms ease;
+  }
+  .chip:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  footer { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; color: var(--muted); font-size: 12px; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; background: #1b1d21; color: #f4f4f5;
+    padding: 9px 14px; border-radius: 9px; font-size: 12.5px; box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+    opacity: 0; transform: translateY(6px); transition: opacity 160ms ease, transform 160ms ease;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+  @media (max-width: 560px) {
+    .wrap { padding: 32px 16px 48px; }
+    .value { font-size: 46px; }
+    thead th, tbody td { padding-left: 12px; padding-right: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <p class="eyebrow">Thermal monitor</p>
+      <h1>Temperature</h1>
+      <p class="sub">MacBook Pro pushing to <span id="serverLabel">ubuntu03</span></p>
+    </div>
+    <span class="pill" id="statusPill"><span class="dot"></span><span id="statusText">connecting</span></span>
+  </header>
+
+  <div class="grid">
+    <article class="card" id="macCard">
+      <div class="card-head">
+        <span class="card-title">MacBook Pro</span>
+        <span class="card-tag" id="macSource">—</span>
+      </div>
+      <div class="temp"><span class="value" id="macValue">—</span><span class="unit">°C</span></div>
+      <div class="meta" id="macMeta"></div>
+      <svg class="spark" id="macSpark" viewBox="0 0 300 46" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="empty" id="macEmpty">Waiting for the first push from the Mac…</div>
+    </article>
+
+    <article class="card" id="serverCard">
+      <div class="card-head">
+        <span class="card-title" id="serverTitle">Server</span>
+        <span class="card-tag" id="serverTag">sysfs</span>
+      </div>
+      <div class="temp"><span class="value" id="serverValue">—</span><span class="unit">°C</span></div>
+      <div class="meta" id="serverMeta"></div>
+      <svg class="spark" id="serverSpark" viewBox="0 0 300 46" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="zones" id="serverZones"></div>
+    </article>
+  </div>
+
+  <section class="table-card">
+    <div class="table-head">
+      <h2>Recent readings</h2>
+      <span class="count" id="rowCount">0 readings</span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Node</th><th>CPU</th><th>GPU</th><th>Fans</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <button class="chip" id="endpoint" title="Copy endpoint">http://ubuntu03:30100</button>
+    <span>updates every 5s · sorted newest first</span>
+  </footer>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { snapshot: null, lastFetch: 0 };
+
+function fmtTemp(v) {
+  return v == null ? "—" : v.toFixed(1);
+}
+
+function heatClass(v) {
+  if (v == null) return "";
+  if (v >= 85) return "critical";
+  if (v >= 72) return "hot";
+  return "";
+}
+
+function ago(ms) {
+  if (!ms) return "—";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return s + "s ago";
+  const m = Math.round(s / 60);
+  if (m < 60) return m + "m ago";
+  return Math.round(m / 60) + "h ago";
+}
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function sparkline(svg, values, color) {
+  const w = 300, h = 46, pad = 3;
+  if (!values || values.length < 2) { svg.innerHTML = ""; return; }
+  let min = Math.min(...values), max = Math.max(...values);
+  if (max - min < 1.5) { min -= 0.75; max += 0.75; }
+  const span = max - min || 1;
+  const step = (w - pad * 2) / (values.length - 1);
+  const pts = values.map((v, i) => [pad + i * step, h - pad - ((v - min) / span) * (h - pad * 2)]);
+  const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  const area = line + ` L${w - pad} ${h} L${pad} ${h} Z`;
+  svg.innerHTML =
+    `<path d="${area}" fill="${color}" opacity="0.10"></path>` +
+    `<path d="${line}" fill="none" stroke="${color}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"></path>` +
+    `<circle cx="${pts[pts.length - 1][0].toFixed(1)}" cy="${pts[pts.length - 1][1].toFixed(1)}" r="2.4" fill="${color}"></circle>`;
+}
+
+function setStatus(mac) {
+  const pill = $("statusPill"), text = $("statusText");
+  pill.classList.remove("live", "stale");
+  if (!mac) { text.textContent = "waiting for Mac"; return; }
+  const age = Date.now() - mac.ts_ms;
+  if (age < 90000) { pill.classList.add("live"); text.textContent = "live · " + ago(mac.ts_ms); }
+  else { pill.classList.add("stale"); text.textContent = "stale · " + ago(mac.ts_ms); }
+}
+
+function renderMac(mac, history) {
+  $("macValue").textContent = fmtTemp(mac?.cpu_c);
+  $("macValue").className = "value " + heatClass(mac?.cpu_c);
+  $("macSource").textContent = mac ? (mac.source || "push") : "—";
+  $("macEmpty").style.display = mac ? "none" : "block";
+
+  const meta = $("macMeta");
+  meta.replaceChildren();
+  if (mac) {
+    const add = (label, value) => {
+      const b = document.createElement("b"); b.textContent = value;
+      const s = document.createElement("span"); s.append(label + " ");
+      s.append(b); meta.append(s);
+    };
+    if (mac.gpu_c != null) add("GPU", fmtTemp(mac.gpu_c) + " °C");
+    if (mac.fans?.length) add("Fans", mac.fans.map(f => f.rpm.toLocaleString() + " rpm").join(" · "));
+    add("Updated", ago(mac.ts_ms));
+  }
+  sparkline($("macSpark"), history.map(r => r.cpu_c).filter(v => v != null), "var(--accent)");
+}
+
+function renderServer(server, history) {
+  $("serverTitle").textContent = server.host || "Server";
+  $("serverValue").textContent = fmtTemp(server.cpu_c);
+  $("serverValue").className = "value " + heatClass(server.cpu_c);
+  $("serverTag").textContent = server.source || "sysfs";
+
+  const meta = $("serverMeta");
+  meta.replaceChildren();
+  const add = (label, value) => {
+    const b = document.createElement("b"); b.textContent = value;
+    const s = document.createElement("span"); s.append(label + " "); s.append(b);
+    meta.append(s);
+  };
+  add("Zones", String(server.zones?.length ?? 0));
+  add("Sampled", ago(server.ts_ms));
+
+  const zones = $("serverZones");
+  zones.replaceChildren();
+  const top = [...(server.zones || [])].sort((a, b) => b.temp_c - a.temp_c).slice(0, 3);
+  if (!top.length) {
+    const d = document.createElement("div");
+    d.className = "empty"; d.style.marginTop = "0";
+    d.textContent = "No thermal zones exposed on this host.";
+    zones.append(d);
+  }
+  for (const z of top) {
+    const row = document.createElement("div"); row.className = "zone";
+    const name = document.createElement("span"); name.textContent = z.name;
+    const val = document.createElement("span"); val.textContent = fmtTemp(z.temp_c) + " °C";
+    row.append(name, val); zones.append(row);
+  }
+  sparkline($("serverSpark"), history.map(r => r.cpu_c).filter(v => v != null), "var(--accent)");
+}
+
+function renderRows(macHistory, serverHistory) {
+  const rows = [
+    ...macHistory.map(r => ({ ...r, kind: "mac" })),
+    ...serverHistory.map(r => ({ ...r, kind: "server" })),
+  ].sort((a, b) => b.ts_ms - a.ts_ms).slice(0, 24);
+
+  $("rowCount").textContent = rows.length + (rows.length === 1 ? " reading" : " readings");
+  const body = $("rows");
+  body.replaceChildren();
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    const td = (text, cls) => {
+      const c = document.createElement("td");
+      if (cls) c.className = cls;
+      c.textContent = text;
+      return c;
+    };
+    tr.append(
+      td(fmtTime(r.ts_ms), "time"),
+      td(r.host || r.kind, "node"),
+      td(fmtTemp(r.cpu_c) + " °C", "num"),
+      td(r.gpu_c == null ? "—" : fmtTemp(r.gpu_c) + " °C", "num"),
+      td(r.fans?.length ? r.fans.map(f => f.rpm.toLocaleString()).join(" · ") : "—", "num"),
+    );
+    body.append(tr);
+  }
+}
+
+function render(s) {
+  const mac = s.mac || null;
+  renderMac(mac, s.mac_history || []);
+  renderServer(s.server, s.server_history || []);
+  renderRows(s.mac_history || [], s.server_history || []);
+  $("serverLabel").textContent = s.server?.host || "server";
+  setStatus(mac);
+}
+
+async function tick() {
+  try {
+    const res = await fetch("/api/temps", { cache: "no-store" });
+    state.snapshot = await res.json();
+    state.lastFetch = Date.now();
+    render(state.snapshot);
+  } catch (e) {
+    const pill = $("statusPill");
+    pill.classList.remove("live");
+    pill.classList.add("stale");
+    $("statusText").textContent = "server unreachable";
+  }
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 1500);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Copied " + text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.append(ta); ta.select();
+    try { document.execCommand("copy"); toast("Copied " + text); } catch {}
+    ta.remove();
+  }
+}
+
+$("endpoint").addEventListener("click", () => {
+  if (window.getSelection().toString()) return;
+  copyText($("endpoint").textContent.trim());
+});
+
+setInterval(() => {
+  if (state.snapshot) setStatus(state.snapshot.mac || null);
+}, 1000);
+
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>

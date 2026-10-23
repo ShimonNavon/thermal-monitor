@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thermal-monitor
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thermal-monitor
+  namespace: thermal-monitor
+  labels:
+    app: thermal-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thermal-monitor
+  template:
+    metadata:
+      labels:
+        app: thermal-monitor
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu04
+      containers:
+        - name: app
+          image: localhost:5000/thermal-monitor:20261023.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: BIND
+              value: "0.0.0.0:8080"
+            - name: HOST_LABEL
+              value: ubuntu04
+            - name: THERMAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: thermal-token
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thermal-monitor
+  namespace: thermal-monitor
+spec:
+  type: NodePort
+  selector:
+    app: thermal-monitor
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30100

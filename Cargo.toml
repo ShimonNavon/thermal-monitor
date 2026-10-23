@@ -1,0 +1,20 @@
+[package]
+name = "thermal-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "Mac + server temperature dashboard"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
