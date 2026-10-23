@@ -1,6 +1,6 @@
 # Thermal Monitor
 
-Live heat and load for my whole setup: the MacBook Pro and both Kubernetes nodes, in one dark dashboard.
+Live heat and load for my whole home lab: the MacBook Pro and all four Ubuntu machines, in one dark dashboard.
 
 **Dashboard:** http://ubuntu03:30100/ (tailnet) · **Gallery:** https://projects.navonsimon.com/
 
@@ -8,17 +8,18 @@ Live heat and load for my whole setup: the MacBook Pro and both Kubernetes nodes
 
 ## What it shows
 
-Each machine reports CPU/GPU temperature, load averages, memory and disk usage, uptime, core count, clock speed, fan RPMs and individual thermal zones. The Mac adds GPU and fan sensors from `macmon`; the servers read Linux sysfs, hwmon and `/proc`.
+Each machine reports CPU/GPU temperature, load averages, memory and disk usage, uptime, core count, clock speed, fan RPMs and individual thermal zones. The Mac adds GPU and fan sensors from `macmon`; every Linux machine reads sysfs, hwmon and `/proc`.
 
 ```
-MacBook Pro (launchd, every 15 s) ──┐
-                                    ├──►  thermal-monitor (axum)  ──►  dashboard + JSON API
-ubuntu03  (DaemonSet, every 15 s) ──┤     stores latest + 3 min history
-ubuntu04  (DaemonSet, every 15 s) ──┘     serves :30100 on the tailnet
+MacBook Pro  (launchd, every 15 s) ──┐
+ubuntu01/02  (systemd, every 15 s) ──┤
+ubuntu03/04  (DaemonSet, every 15 s) ─┴──►  thermal-monitor (axum)  ──►  dashboard + JSON API
+                                            latest per host + 3 min history
+                                            serves :30100 on the tailnet
 ```
 
 - `serve` — the collector/API/dashboard. In-memory only: latest reading per host plus a rolling history (180 samples).
-- `push` — samples the local machine and posts a reading. Runs from launchd on macOS and as a Kubernetes DaemonSet on the cluster.
+- `push` — samples the local machine and posts a reading. Runs from launchd on macOS, from systemd user units on the two non-Kubernetes machines, and as a Kubernetes DaemonSet on the cluster nodes.
 - `read` — prints one local sample as JSON.
 - `/agent/binary` — the running binary serves itself; the DaemonSet pulls it at startup, so agents don't need the private registry.
 - Only one server replica by design: history lives in memory and resets on rollout.
@@ -56,14 +57,48 @@ kubectl -n thermal-monitor create secret generic thermal-token \
 ```
 
 - `Deployment` on **ubuntu04** (the image registry only listens on its loopback), NodePort **30100**.
-- `DaemonSet` on every node. It downloads the binary from the server and mounts the host root read-only for accurate disk usage.
+- `DaemonSet` on every cluster node. It downloads the binary from the server and mounts the host root read-only for accurate disk usage.
+- `ubuntu01` and `ubuntu02` are not Kubernetes nodes; they run the static binary as a systemd user service (see below).
 
-## Mac collector
+## Agents
+
+### Upgrade the binary everywhere
+
+```sh
+cargo build --release
+cp target/release/thermal-monitor bin/thermal          # Mac
+docker create thermal-monitor:<tag>                    # Linux agents
+```
+
+The Linux agents on `ubuntu01/02` live at `~/.local/bin/thermal` and are restarted with `systemctl --user restart thermal-agent`.
+
+### systemd user unit (ubuntu01, ubuntu02)
+
+`~/.config/systemd/user/thermal-agent.service`:
+
+```ini
+[Unit]
+Description=Thermal monitor agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/thermal push --url http://100.119.17.32:30100/api/report
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user enable --now thermal-agent
+```
+
+### Mac collector
 
 ```sh
 brew install macmon
-cargo build --release
-cp target/release/thermal-monitor bin/thermal
 mkdir -p ~/.config/thermal-monitor
 printf '%s' '<token>' > ~/.config/thermal-monitor/token
 chmod 600 ~/.config/thermal-monitor/token

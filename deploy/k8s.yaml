@@ -24,7 +24,7 @@ spec:
         kubernetes.io/hostname: ubuntu04
       containers:
         - name: app
-          image: localhost:5000/thermal-monitor:20261023.5
+          image: localhost:5000/thermal-monitor:20261023.6
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
